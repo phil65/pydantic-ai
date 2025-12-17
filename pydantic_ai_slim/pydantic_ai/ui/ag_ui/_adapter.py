@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping, Sequence
 from functools import cached_property
 from typing import (
@@ -12,14 +13,19 @@ from typing import (
 
 from ... import ExternalToolset, ToolDefinition
 from ...messages import (
+    AudioUrl,
+    BinaryContent,
     BuiltinToolCallPart,
     BuiltinToolReturnPart,
+    DocumentUrl,
+    ImageUrl,
     ModelMessage,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
+    VideoUrl,
 )
 from ...output import OutputDataT
 from ...tools import AgentDepsT
@@ -29,10 +35,12 @@ try:
     from ag_ui.core import (
         AssistantMessage,
         BaseEvent,
+        BinaryInputContent,
         DeveloperMessage,
         Message,
         RunAgentInput,
         SystemMessage,
+        TextInputContent,
         Tool as AGUITool,
         ToolMessage,
         UserMessage,
@@ -47,9 +55,56 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 if TYPE_CHECKING:
-    pass
+    from ...messages import UserContent
 
 __all__ = ['AGUIAdapter']
+
+
+def _convert_agui_content(content: str | list[TextInputContent | BinaryInputContent]) -> str | list[UserContent]:
+    """Convert AG-UI message content to pydantic-ai UserContent format.
+
+    AG-UI UserMessage.content can be:
+    - str: plain text (pass through)
+    - list[TextInputContent | BinaryInputContent]: structured content
+
+    This converts AG-UI content types to pydantic-ai equivalents:
+    - TextInputContent -> str
+    - BinaryInputContent with URL -> ImageUrl/AudioUrl/VideoUrl/DocumentUrl based on mime_type
+    - BinaryInputContent with data -> BinaryContent
+
+    Args:
+        content: AG-UI message content
+
+    Returns:
+        Content in pydantic-ai format
+    """
+    if isinstance(content, str):
+        return content
+
+    result: list[UserContent] = []
+    for item in content:
+        if isinstance(item, TextInputContent):
+            result.append(item.text)
+        elif isinstance(item, BinaryInputContent):
+            if item.url:
+                # Convert URL-based content to appropriate pydantic-ai URL type based on mime_type
+                if item.mime_type.startswith('image/'):
+                    result.append(ImageUrl(url=item.url, media_type=item.mime_type))
+                elif item.mime_type.startswith('audio/'):
+                    result.append(AudioUrl(url=item.url, media_type=item.mime_type))
+                elif item.mime_type.startswith('video/'):
+                    result.append(VideoUrl(url=item.url, media_type=item.mime_type))
+                else:
+                    # Default to DocumentUrl for other types (PDF, text, etc.)
+                    result.append(DocumentUrl(url=item.url, media_type=item.mime_type))
+            elif item.data:
+                # data is base64 encoded
+                result.append(BinaryContent(data=base64.b64decode(item.data), media_type=item.mime_type))
+        else:
+            # Unknown type - try to convert to string
+            result.append(str(item))
+
+    return result
 
 
 # Frontend toolset
@@ -128,7 +183,8 @@ class AGUIAdapter(UIAdapter[RunAgentInput, Message, BaseEvent, AgentDepsT, Outpu
                 isinstance(msg, ToolMessage) and not msg.tool_call_id.startswith(BUILTIN_TOOL_CALL_ID_PREFIX)
             ):
                 if isinstance(msg, UserMessage):
-                    builder.add(UserPromptPart(content=msg.content))
+                    content = _convert_agui_content(msg.content)
+                    builder.add(UserPromptPart(content=content))
                 elif isinstance(msg, SystemMessage | DeveloperMessage):
                     builder.add(SystemPromptPart(content=msg.content))
                 else:
